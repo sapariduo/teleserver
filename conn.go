@@ -1,0 +1,545 @@
+package teleserver
+
+import (
+	"context"
+	"net"
+	"sync"
+	"time"
+
+	"github.com/leesper/holmes"
+)
+
+const (
+	// MessageTypeBytes is the length of type header.
+	MessageTypeBytes = 4
+	// MessageLenBytes is the length of length header.
+	MessageLenBytes = 4
+	// MessageMaxBytes is the maximum bytes allowed for application data.
+	MessageMaxBytes = 1 << 10 // 1 KB
+)
+
+// MessageHandler is a combination of message and its handler function.
+type MessageHandler struct {
+	message Message
+	handler HandlerFunc
+}
+
+// WriteCloser is the interface that groups Write and Close methods.
+type WriteCloser interface {
+	Write(Message) error
+	Close()
+}
+
+// ServerConn represents a server connection to a TCP server, it implments Conn.
+type ServerConn struct {
+	netid     int64
+	belong    *Server
+	rawConn   net.Conn
+	extraData interface{}
+
+	once      *sync.Once
+	wg        *sync.WaitGroup
+	sendCh    chan []byte
+	handlerCh chan MessageHandler
+	timerCh   chan *OnTimeOut
+
+	mu      sync.Mutex // guards following
+	name    string
+	heart   int64
+	pending []int64
+	ctx     context.Context
+	cancel  context.CancelFunc
+}
+
+// NewServerConn returns a new server connection which has not started to
+// serve requests yet.
+func NewServerConn(id int64, s *Server, c net.Conn) *ServerConn {
+	sc := &ServerConn{
+		netid:     id,
+		belong:    s,
+		rawConn:   c,
+		once:      &sync.Once{},
+		wg:        &sync.WaitGroup{},
+		sendCh:    make(chan []byte, s.opts.bufferSize),
+		handlerCh: make(chan MessageHandler, s.opts.bufferSize),
+		timerCh:   make(chan *OnTimeOut, s.opts.bufferSize),
+		heart:     time.Now().UnixNano(),
+	}
+	sc.ctx, sc.cancel = context.WithCancel(context.WithValue(s.ctx, serverCtx, s))
+	sc.name = c.RemoteAddr().String()
+	sc.pending = []int64{}
+	return sc
+}
+
+// ServerFromContext returns the server within the context.
+func ServerFromContext(ctx context.Context) (*Server, bool) {
+	server, ok := ctx.Value(serverCtx).(*Server)
+	return server, ok
+}
+
+// NetID returns net ID of server connection.
+func (sc *ServerConn) NetID() int64 {
+	return sc.netid
+}
+
+// SetName sets name of server connection.
+func (sc *ServerConn) SetName(name string) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	sc.name = name
+}
+
+// Name returns the name of server connection.
+func (sc *ServerConn) Name() string {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	name := sc.name
+	return name
+}
+
+// SetHeartBeat sets the heart beats of server connection.
+func (sc *ServerConn) SetHeartBeat(heart int64) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	sc.heart = heart
+}
+
+// HeartBeat returns the heart beats of server connection.
+func (sc *ServerConn) HeartBeat() int64 {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	heart := sc.heart
+	return heart
+}
+
+// SetContextValue sets extra data to server connection.
+func (sc *ServerConn) SetContextValue(k, v interface{}) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	sc.ctx = context.WithValue(sc.ctx, k, v)
+}
+
+// ContextValue gets extra data from server connection.
+func (sc *ServerConn) ContextValue(k interface{}) interface{} {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	return sc.ctx.Value(k)
+}
+
+// GetExtraData gets the extra data from the Conn
+func (sc *ServerConn) GetExtraData() interface{} {
+	return sc.extraData
+}
+
+// PutExtraData puts the extra data with the Conn
+func (sc *ServerConn) PutExtraData(data interface{}) {
+	sc.extraData = data
+}
+
+// Start starts the server connection, creating go-routines for reading,
+// writing and handlng.
+func (sc *ServerConn) Start() {
+	holmes.Infof("conn start, <%v -> %v>\n", sc.rawConn.LocalAddr(), sc.rawConn.RemoteAddr())
+	onConnect := sc.belong.opts.onConnect
+	if onConnect != nil {
+		onConnect(sc)
+	}
+
+	loopers := []func(WriteCloser, *sync.WaitGroup){readLoop, writeLoop, handleLoop}
+	for _, l := range loopers {
+		looper := l
+		sc.wg.Add(1)
+		go looper(sc, sc.wg)
+	}
+}
+
+// Close gracefully closes the server connection. It blocked until all sub
+// go-routines are completed and returned.
+func (sc *ServerConn) Close() {
+	sc.once.Do(func() {
+		holmes.Infof("conn close gracefully, <%v -> %v>\n", sc.rawConn.LocalAddr(), sc.rawConn.RemoteAddr())
+
+		// callback on close
+		onClose := sc.belong.opts.onClose
+		if onClose != nil {
+			onClose(sc)
+		}
+
+		// remove connection from server
+		sc.belong.conns.Delete(sc.netid)
+		addTotalConn(-1)
+
+		// close net.Conn, any blocked read or write operation will be unblocked and
+		// return errors.
+		if tc, ok := sc.rawConn.(*net.TCPConn); ok {
+			// avoid time-wait state
+			tc.SetLinger(0)
+		}
+		sc.rawConn.Close()
+
+		// cancel readLoop, writeLoop and handleLoop go-routines.
+		sc.mu.Lock()
+		sc.cancel()
+		pending := sc.pending
+		sc.pending = nil
+		sc.mu.Unlock()
+
+		// clean up pending timers
+		for _, id := range pending {
+			sc.CancelTimer(id)
+		}
+
+		// wait until all go-routines exited.
+		sc.wg.Wait()
+
+		// close all channels and block until all go-routines exited.
+		close(sc.sendCh)
+		close(sc.handlerCh)
+		close(sc.timerCh)
+
+		// tell server I'm done :( .
+		sc.belong.wg.Done()
+	})
+}
+
+// AddPendingTimer adds a timer ID to server Connection.
+func (sc *ServerConn) AddPendingTimer(timerID int64) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if sc.pending != nil {
+		sc.pending = append(sc.pending, timerID)
+	}
+}
+
+// Write writes a message to the client.
+func (sc *ServerConn) Write(message Message) error {
+	return asyncWrite(sc, message)
+}
+
+// RunAt runs a callback at the specified timestamp.
+func (sc *ServerConn) RunAt(timestamp time.Time, callback func(time.Time, WriteCloser)) int64 {
+	id := runAt(sc.ctx, sc.netid, sc.belong.timing, timestamp, callback)
+	if id >= 0 {
+		sc.AddPendingTimer(id)
+	}
+	return id
+}
+
+// RunAfter runs a callback right after the specified duration ellapsed.
+func (sc *ServerConn) RunAfter(duration time.Duration, callback func(time.Time, WriteCloser)) int64 {
+	id := runAfter(sc.ctx, sc.netid, sc.belong.timing, duration, callback)
+	if id >= 0 {
+		sc.AddPendingTimer(id)
+	}
+	return id
+}
+
+// RunEvery runs a callback on every interval time.
+func (sc *ServerConn) RunEvery(interval time.Duration, callback func(time.Time, WriteCloser)) int64 {
+	id := runEvery(sc.ctx, sc.netid, sc.belong.timing, interval, callback)
+	if id >= 0 {
+		sc.AddPendingTimer(id)
+	}
+	return id
+}
+
+// CancelTimer cancels a timer with the specified ID.
+func (sc *ServerConn) CancelTimer(timerID int64) {
+	cancelTimer(sc.belong.timing, timerID)
+}
+
+func cancelTimer(timing *TimingWheel, timerID int64) {
+	if timing != nil {
+		timing.CancelTimer(timerID)
+	}
+}
+
+// RemoteAddr returns the remote address of server connection.
+func (sc *ServerConn) RemoteAddr() net.Addr {
+	return sc.rawConn.RemoteAddr()
+}
+
+// LocalAddr returns the local address of server connection.
+func (sc *ServerConn) LocalAddr() net.Addr {
+	return sc.rawConn.LocalAddr()
+}
+
+func runAt(ctx context.Context, netID int64, timing *TimingWheel, ts time.Time, cb func(time.Time, WriteCloser)) int64 {
+	timeout := NewOnTimeOut(NewContextWithNetID(ctx, netID), cb)
+	return timing.AddTimer(ts, 0, timeout)
+}
+
+func runAfter(ctx context.Context, netID int64, timing *TimingWheel, d time.Duration, cb func(time.Time, WriteCloser)) int64 {
+	delay := time.Now().Add(d)
+	return runAt(ctx, netID, timing, delay, cb)
+}
+
+func runEvery(ctx context.Context, netID int64, timing *TimingWheel, d time.Duration, cb func(time.Time, WriteCloser)) int64 {
+	delay := time.Now().Add(d)
+	timeout := NewOnTimeOut(NewContextWithNetID(ctx, netID), cb)
+	return timing.AddTimer(delay, d, timeout)
+}
+
+func asyncWrite(c interface{}, m Message) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = ErrServerClosed
+		}
+	}()
+
+	var (
+		pkt    []byte
+		sendCh chan []byte
+	)
+	switch c := c.(type) {
+	case *ServerConn:
+		pkt, err = c.belong.opts.codec.Encode(m)
+		sendCh = c.sendCh
+
+		// case *ClientConn:
+		// 	pkt, err = c.opts.codec.Encode(m)
+		// 	sendCh = c.sendCh
+	}
+
+	if err != nil {
+		holmes.Errorf("asyncWrite error %v\n", err)
+		return
+	}
+
+	select {
+	case sendCh <- pkt:
+		err = nil
+	default:
+		err = ErrWouldBlock
+	}
+	return
+}
+
+/* readLoop() blocking read from connection, deserialize bytes into message,
+then find corresponding handler, put it into channel */
+func readLoop(c WriteCloser, wg *sync.WaitGroup) {
+	var (
+		rawConn          net.Conn
+		codec            Codec
+		cDone            <-chan struct{}
+		sDone            <-chan struct{}
+		setHeartBeatFunc func(int64)
+		onMessage        onMessageFunc
+		handlerCh        chan MessageHandler
+		msg              Message
+		err              error
+	)
+
+	switch c := c.(type) {
+	case *ServerConn:
+		rawConn = c.rawConn
+		codec = c.belong.opts.codec
+		cDone = c.ctx.Done()
+		sDone = c.belong.ctx.Done()
+		setHeartBeatFunc = c.SetHeartBeat
+		onMessage = c.belong.opts.onMessage
+		handlerCh = c.handlerCh
+		// case *ClientConn:
+		// 	rawConn = c.rawConn
+		// 	codec = c.opts.codec
+		// 	cDone = c.ctx.Done()
+		// 	sDone = nil
+		// 	setHeartBeatFunc = c.SetHeartBeat
+		// 	onMessage = c.opts.onMessage
+		// 	handlerCh = c.handlerCh
+	}
+
+	defer func() {
+		if p := recover(); p != nil {
+			holmes.Errorf("panics: %v\n", p)
+		}
+		wg.Done()
+		holmes.Debugln("readLoop go-routine exited")
+		c.Close()
+	}()
+
+	for {
+		select {
+		case <-cDone: // connection closed
+			holmes.Debugln("receiving cancel signal from conn")
+			return
+		case <-sDone: // server closed
+			holmes.Debugln("receiving cancel signal from server")
+			return
+		default:
+			msg, err = codec.Decode(rawConn)
+			if err != nil {
+				holmes.Errorf("error decoding message %v\n", err)
+				if _, ok := err.(ErrUndefined); ok {
+					// update heart beats
+					setHeartBeatFunc(time.Now().UnixNano())
+					continue
+				}
+				return
+			}
+			setHeartBeatFunc(time.Now().UnixNano())
+			handler := GetHandlerFunc(msg.MessageNumber())
+			if handler == nil {
+				if onMessage != nil {
+					holmes.Infof("message %d call onMessage()\n", msg.MessageNumber())
+					onMessage(msg, c.(WriteCloser))
+				} else {
+					holmes.Warnf("no handler or onMessage() found for message %d\n", msg.MessageNumber())
+				}
+				continue
+			}
+			handlerCh <- MessageHandler{msg, handler}
+		}
+	}
+}
+
+/* writeLoop() receive message from channel, serialize it into bytes,
+then blocking write into connection */
+func writeLoop(c WriteCloser, wg *sync.WaitGroup) {
+	var (
+		rawConn net.Conn
+		sendCh  chan []byte
+		cDone   <-chan struct{}
+		sDone   <-chan struct{}
+		pkt     []byte
+		err     error
+	)
+
+	switch c := c.(type) {
+	case *ServerConn:
+		rawConn = c.rawConn
+		sendCh = c.sendCh
+		cDone = c.ctx.Done()
+		sDone = c.belong.ctx.Done()
+		// case *ClientConn:
+		// 	rawConn = c.rawConn
+		// 	sendCh = c.sendCh
+		// 	cDone = c.ctx.Done()
+		// 	sDone = nil
+	}
+
+	defer func() {
+		if p := recover(); p != nil {
+			holmes.Errorf("panics: %v\n", p)
+		}
+		// drain all pending messages before exit
+	OuterFor:
+		for {
+			select {
+			case pkt = <-sendCh:
+				if pkt != nil {
+					if _, err = rawConn.Write(pkt); err != nil {
+						holmes.Errorf("error writing data %v\n", err)
+					}
+				}
+			default:
+				break OuterFor
+			}
+		}
+		wg.Done()
+		holmes.Debugln("writeLoop go-routine exited")
+		c.Close()
+	}()
+
+	for {
+		select {
+		case <-cDone: // connection closed
+			holmes.Debugln("receiving cancel signal from conn")
+			return
+		case <-sDone: // server closed
+			holmes.Debugln("receiving cancel signal from server")
+			return
+		case pkt = <-sendCh:
+			if pkt != nil {
+				if _, err = rawConn.Write(pkt); err != nil {
+					holmes.Errorf("error writing data %v\n", err)
+					return
+				}
+			}
+		}
+	}
+}
+
+// handleLoop() - put handler or timeout callback into worker go-routines
+func handleLoop(c WriteCloser, wg *sync.WaitGroup) {
+	var (
+		cDone        <-chan struct{}
+		sDone        <-chan struct{}
+		timerCh      chan *OnTimeOut
+		handlerCh    chan MessageHandler
+		netID        int64
+		ctx          context.Context
+		askForWorker bool
+		err          error
+	)
+
+	switch c := c.(type) {
+	case *ServerConn:
+		cDone = c.ctx.Done()
+		sDone = c.belong.ctx.Done()
+		timerCh = c.timerCh
+		handlerCh = c.handlerCh
+		netID = c.netid
+		ctx = c.ctx
+		askForWorker = true
+		// case *ClientConn:
+		// 	cDone = c.ctx.Done()
+		// 	sDone = nil
+		// 	timerCh = c.timing.timeOutChan
+		// 	handlerCh = c.handlerCh
+		// 	netID = c.netid
+		// 	ctx = c.ctx
+	}
+
+	defer func() {
+		if p := recover(); p != nil {
+			holmes.Errorf("panics: %v\n", p)
+		}
+		wg.Done()
+		holmes.Debugln("handleLoop go-routine exited")
+		c.Close()
+	}()
+
+	for {
+		select {
+		case <-cDone: // connectin closed
+			holmes.Debugln("receiving cancel signal from conn")
+			return
+		case <-sDone: // server closed
+			holmes.Debugln("receiving cancel signal from server")
+			return
+		case msgHandler := <-handlerCh:
+			msg, handler := msgHandler.message, msgHandler.handler
+			if handler != nil {
+				if askForWorker {
+					err = WorkerPoolInstance().Put(netID, func() {
+						handler(NewContextWithNetID(NewContextWithMessage(ctx, msg), netID), c)
+					})
+					if err != nil {
+						holmes.Errorln(err)
+					}
+					addTotalHandle()
+				} else {
+					handler(NewContextWithNetID(NewContextWithMessage(ctx, msg), netID), c)
+				}
+			}
+		case timeout := <-timerCh:
+			if timeout != nil {
+				timeoutNetID := NetIDFromContext(timeout.Ctx)
+				if timeoutNetID != netID {
+					holmes.Errorf("timeout net %d, conn net %d, mismatched!\n", timeoutNetID, netID)
+				}
+				if askForWorker {
+					err = WorkerPoolInstance().Put(netID, func() {
+						timeout.Callback(time.Now(), c.(WriteCloser))
+					})
+					if err != nil {
+						holmes.Errorln(err)
+					}
+				} else {
+					timeout.Callback(time.Now(), c.(WriteCloser))
+				}
+			}
+		}
+	}
+}
