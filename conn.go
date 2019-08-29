@@ -32,10 +32,9 @@ type WriteCloser interface {
 
 // ServerConn represents a server connection to a TCP server, it implments Conn.
 type ServerConn struct {
-	netid     int64
-	belong    *Server
-	rawConn   net.Conn
-	extraData interface{}
+	netid   int64
+	belong  *Server
+	rawConn net.Conn
 
 	once      *sync.Once
 	wg        *sync.WaitGroup
@@ -124,16 +123,6 @@ func (sc *ServerConn) ContextValue(k interface{}) interface{} {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	return sc.ctx.Value(k)
-}
-
-// GetExtraData gets the extra data from the Conn
-func (sc *ServerConn) GetExtraData() interface{} {
-	return sc.extraData
-}
-
-// PutExtraData puts the extra data with the Conn
-func (sc *ServerConn) PutExtraData(data interface{}) {
-	sc.extraData = data
 }
 
 // Start starts the server connection, creating go-routines for reading,
