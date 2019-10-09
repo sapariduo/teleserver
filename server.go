@@ -286,7 +286,7 @@ func (s *Server) Start(l net.Listener) error {
 		s.conns.Range(func(k, v interface{}) bool {
 			i := k.(int64)
 			c := v.(*ServerConn)
-			holmes.Infof("client(%d) %s", i, c.Name())
+			holmes.Debugf("client(%d) %s", i, c.Name())
 			return true
 		})
 	} // for loop
