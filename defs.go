@@ -34,7 +34,7 @@ var (
 
 // definitions about some constants.
 const (
-	MaxConnections    = 10000
+	MaxConnections    = 20000
 	BufferSize128     = 128
 	BufferSize256     = 256
 	BufferSize512     = 512
